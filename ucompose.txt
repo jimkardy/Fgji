@@ -1,0 +1,2405 @@
+#!/bin/sh
+''':'
+# ---- ucompose self-bootstrap (POSIX sh). Python sees this as a string. ----
+# Finds a python3, sets up the environment, drops root if needed,
+# then execs THIS SAME FILE as Python. Users just run: ./ucompose <cmd>
+UC_PYTHON="${UCOMPOSE_PYTHON:-}"
+UC_SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd) || UC_SELF_DIR=""
+if [ -z "$UC_PYTHON" ]; then
+    for c in python3 \
+             "$UC_SELF_DIR/py/usr/bin/python3" \
+             "${HOME:-}/a/py/usr/bin/python3" \
+             "${PREFIX:-/nonexistent}/bin/python3"; do
+        if [ -x "$c" ]; then UC_PYTHON="$c"; break; fi
+        p=$(command -v -- "$c" 2>/dev/null) && [ -n "$p" ] && { UC_PYTHON="$p"; break; }
+    done
+fi
+if [ -z "$UC_PYTHON" ]; then
+    echo "ucompose: no python3 found; install it or set UCOMPOSE_PYTHON=/path/to/python3" >&2
+    exit 127
+fi
+case "$UC_PYTHON" in
+    */py/usr/bin/python3)
+        UC_LIB=$(dirname "$(dirname "$UC_PYTHON")")/lib
+        [ -d "$UC_LIB" ] && LD_LIBRARY_PATH="$UC_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        export LD_LIBRARY_PATH ;;
+esac
+if [ "$(id -u 2>/dev/null || echo 0)" = "0" ] && [ -z "${UCOMPOSE_ALLOW_ROOT:-}" ]; then
+    UC_RUN=""
+    for r in "$UC_SELF_DIR/bin/sandbox-run.sh" "${HOME:-}/a/bin/sandbox-run.sh"; do
+        [ -f "$r" ] && { UC_RUN="$r"; break; }
+    done
+    if [ -n "$UC_RUN" ]; then
+        exec sh "$UC_RUN" "$UC_PYTHON" "$0" "$@"
+    elif command -v setpriv >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
+        exec setpriv --reuid=65534 --regid=65534 --clear-groups \
+                     env HOME="${HOME:-/tmp}" "$UC_PYTHON" "$0" "$@"
+    else
+        echo "ucompose: running as root, but udocker refuses root." >&2
+        echo "  re-run as a normal user, or set UCOMPOSE_ALLOW_ROOT=1 to override." >&2
+        exit 1
+    fi
+fi
+exec "$UC_PYTHON" "$0" "$@"
+'''
+# ucompose - docker-compose-like orchestration for udocker
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+VERSION = "0.1.0"
+COMPOSE_FILES = ("compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml")
+STATE_DIRNAME = ".ucompose"
+
+UNSUPPORTED_SERVICE_KEYS = {
+    "build": "udocker cannot build images; use a prebuilt image: reference",
+    "networks": "udocker containers share the host network namespace",
+    "restart": "no daemon exists to enforce restart policies",
+    "healthcheck": "udocker has no health monitoring",
+    "deploy": "swarm-only section",
+    "labels": "metadata only; udocker stores no labels",
+    "dns": "containers share the host resolver",
+    "hostname": "shared network namespace; hostnames cannot be isolated",
+    "tmpfs": "not supported by udocker execution modes",
+    "ulimits": "ulimits are inherited from the invoking shell",
+    "privileged": "meaningless without kernel namespaces",
+}
+INFO_ONLY_SERVICE_KEYS = {"ports": "informational only; udocker shares the host network"}
+
+
+class UserError(Exception):
+    pass
+
+
+def err(msg):
+    sys.stderr.write("ucompose: %s\n" % msg)
+
+
+def warn(msg):
+    sys.stderr.write("ucompose: warning: %s\n" % msg)
+
+
+def die(msg, code=1):
+    err(msg)
+    sys.exit(code)
+
+
+def warn_unsupported(service, cfg):
+    for key in cfg:
+        if key in UNSUPPORTED_SERVICE_KEYS:
+            warn('service "%s": ignoring %s: %s' % (service, key, UNSUPPORTED_SERVICE_KEYS[key]))
+        elif key in INFO_ONLY_SERVICE_KEYS:
+            warn('service "%s": %s is %s' % (service, key, INFO_ONLY_SERVICE_KEYS[key]))
+        elif key not in SERVICE_KEYS:
+            warn('service "%s": unknown or unsupported key "%s"' % (service, key))
+
+
+SERVICE_KEYS = {
+    "image", "container_name", "entrypoint", "command", "environment", "env_file",
+    "volumes", "working_dir", "user", "stdin_open", "tty", "devices", "depends_on",
+    "profiles", "scale", "ports", "networks", "restart", "healthcheck", "deploy",
+    "labels", "dns", "hostname", "tmpfs", "ulimits", "privileged", "init",
+    "stop_grace_period", "expose",
+}
+
+
+class YamlError(UserError):
+    def __init__(self, msg, line=None):
+        self.line = line
+        super().__init__("YAML%s: %s" % ((" (line %d)" % line) if line else "", msg))
+
+
+_SCALAR_NULL = ("~", "null", "Null", "NULL", "")
+
+
+def _parse_scalar(tok):
+    tok = tok.strip()
+    if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in "\"'":
+        return tok[1:-1]
+    if tok in _SCALAR_NULL:
+        return None
+    low = tok.lower()
+    if low in ("true", "yes", "on"):
+        return True
+    if low in ("false", "no", "off"):
+        return False
+    num = tok.replace("_", "")
+    try:
+        return int(num, 0)
+    except ValueError:
+        pass
+    try:
+        f = float(num)
+        if not (f != f) and "x" not in num.lower():
+            return f
+    except ValueError:
+        pass
+    return tok
+
+
+def _split_flow(body):
+    parts, depth, cur, quote = [], 0, [], None
+    for ch in body:
+        if quote:
+            cur.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "\"'":
+            quote = ch
+            cur.append(ch)
+        elif ch in "[{":
+            depth += 1
+            cur.append(ch)
+        elif ch in "]}":
+            depth -= 1
+            cur.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    if "".join(cur).strip():
+        parts.append("".join(cur))
+    return [p.strip() for p in parts]
+
+
+def _parse_flow(text, line=None):
+    text = text.strip()
+    if text.startswith("[") and text.endswith("]"):
+        return [_parse_flow(p, line) for p in _split_flow(text[1:-1])]
+    if text.startswith("{") and text.endswith("}"):
+        out = {}
+        for part in _split_flow(text[1:-1]):
+            if ":" not in part:
+                raise YamlError("bad flow mapping entry: %r" % part, line)
+            k, v = part.split(":", 1)
+            out[_parse_scalar(k)] = _parse_flow(v, line)
+        return out
+    return _parse_scalar(text)
+
+
+def _strip_comment(raw):
+    quote = None
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#" and (i == 0 or raw[i - 1] in " \t"):
+            return raw[:i]
+        i += 1
+    return raw
+
+
+class _Line:
+    __slots__ = ("indent", "text", "num")
+
+    def __init__(self, indent, text, num):
+        self.indent = indent
+        self.text = text
+        self.num = num
+
+
+def _scan_lines(source):
+    lines = []
+    for num, raw in enumerate(source.splitlines(), 1):
+        raw = _strip_comment(raw.rstrip())
+        if not raw.strip():
+            continue
+        stripped = raw.lstrip(" ")
+        if stripped.startswith("\t"):
+            raise YamlError("tabs are not allowed for indentation", num)
+        if stripped in ("---", "..."):
+            continue
+        lines.append(_Line(len(raw) - len(stripped), stripped.rstrip(), num))
+    return lines
+
+
+class MiniYaml:
+    """Parser for the docker-compose YAML subset."""
+
+    def __init__(self, source):
+        self.lines = _scan_lines(source)
+        self.pos = 0
+
+    def parse(self):
+        if not self.lines:
+            return {}
+        node = self._parse_block(self.lines[0].indent)
+        if self.pos < len(self.lines):
+            ln = self.lines[self.pos]
+            raise YamlError("unexpected content: %r" % ln.text[:40], ln.num)
+        return node
+
+    def _peek(self):
+        return self.lines[self.pos] if self.pos < len(self.lines) else None
+
+    def _parse_block(self, indent):
+        ln = self._peek()
+        if ln is None:
+            return None
+        if ln.text.startswith("- ") or ln.text == "-":
+            return self._parse_seq(ln.indent)
+        return self._parse_map(indent)
+
+    def _parse_seq(self, indent):
+        items = []
+        while True:
+            ln = self._peek()
+            if ln is None or ln.indent < indent:
+                break
+            if ln.indent > indent or not (ln.text.startswith("- ") or ln.text == "-"):
+                raise YamlError("bad sequence item: %r" % ln.text[:40], ln.num)
+            rest = ln.text[1:].strip() if ln.text != "-" else ""
+            self.pos += 1
+            if not rest:
+                nxt = self._peek()
+                items.append(self._parse_block(nxt.indent) if nxt and nxt.indent > indent else None)
+                continue
+            m = re.match(r"^([^:\s][^:]*?):(\s+(.*))?$", rest)
+            if m and not rest.startswith(("'", '"', "{", "[")):
+                inner_indent = indent + 2
+                entry = {m.group(1).strip(): _parse_flow(m.group(3), ln.num) if m.group(3) else None}
+                while True:
+                    nxt = self._peek()
+                    if nxt is None or nxt.indent <= indent or nxt.text.startswith("- "):
+                        break
+                    entry.update(self._parse_kv_pair(inner_indent))
+                items.append(entry)
+            else:
+                items.append(_parse_flow(rest, ln.num))
+        return items
+
+    def _parse_kv_pair(self, indent):
+        ln = self._peek()
+        m = re.match(r"^([^:\s][^:]*?):(\s*(.*))$", ln.text)
+        if not m:
+            raise YamlError("expected 'key: value', got: %r" % ln.text[:40], ln.num)
+        key = m.group(1).strip().strip("'\"")
+        val_txt = (m.group(3) or "").strip()
+        val_line, val_col = ln.num, ln.indent + len(m.group(1)) + 1
+        self.pos += 1
+        if val_txt in ("|", "|-", ">", ">-"):
+            return key, self._parse_block_scalar(val_txt, indent)
+        if val_txt:
+            return key, _parse_flow(val_txt, val_line)
+        nxt = self._peek()
+        if nxt and nxt.indent > indent:
+            child = self._parse_block(nxt.indent)
+            return key, child
+        if nxt and nxt.indent == indent and (nxt.text.startswith("- ") or nxt.text == "-"):
+            return key, self._parse_seq(indent)
+        return key, None
+
+    def _parse_map(self, indent):
+        out = {}
+        while True:
+            ln = self._peek()
+            if ln is None or ln.indent < indent:
+                break
+            if ln.indent > indent:
+                raise YamlError("unexpected indentation at: %r" % ln.text[:40], ln.num)
+            if ln.text.startswith("- "):
+                break
+            key, val = self._parse_kv_pair(indent)
+            out[key] = val
+        return out
+
+    def _parse_block_scalar(self, style, parent_indent):
+        literal = style.startswith("|")
+        fold = ">" in style
+        chomp_keep = style.endswith("-") is False
+        collected = []
+        block_indent = None
+        while True:
+            ln = self._peek()
+            if ln is None or ln.indent <= parent_indent:
+                break
+            if block_indent is None:
+                block_indent = ln.indent
+            text = " " * max(0, ln.indent - block_indent) + ln.text
+            collected.append((ln.indent - block_indent, text))
+            self.pos += 1
+        if literal:
+            body = "\n".join(t for _, t in collected)
+        elif fold:
+            parts, prev = [], None
+            for ind, t in collected:
+                if prev is not None and (ind > 0 or t == ""):
+                    parts.append("\n")
+                elif prev is not None:
+                    parts.append(" ")
+                parts.append(t)
+                prev = ind
+            body = "".join(parts)
+        else:
+            body = "\n".join(t for _, t in collected)
+        if chomp_keep and body:
+            body += "\n"
+        return body
+
+
+def yaml_load(text):
+    return MiniYaml(text).parse()
+
+
+_VAR_RE = re.compile(r"\$(?:(\w+)|\{([^}]*)\})")
+
+
+def interpolate(value, variables, strict=True):
+    def sub(m):
+        name = m.group(1) or m.group(2)
+        default, required = None, False
+        op = ""
+        if m.group(2) and re.match(r"^[^:}]+(:?[-?])", m.group(2)):
+            head, sep, tail = re.match(r"^([^:}]+)(:?[-?])(.*)$", m.group(2)).groups()
+            name, op, default = head, sep, tail
+            required = op == "?"
+        if name in variables:
+            return str(variables[name])
+        if required:
+            raise UserError("required variable %s is missing: %s" % (name, default or "a value is required"))
+        if op in (":-", "-"):
+            return default
+        if strict and op != ":":
+            warn('variable "%s" is not set; substituting empty string' % name)
+        return ""
+    return _VAR_RE.sub(sub, value) if isinstance(value, str) else value
+
+
+def deep_interp(node, variables):
+    if isinstance(node, str):
+        return interpolate(node, variables)
+    if isinstance(node, list):
+        return [deep_interp(v, variables) for v in node]
+    if isinstance(node, dict):
+        return {k: deep_interp(v, variables) for k, v in node.items()}
+    return node
+
+
+def parse_env_file(path):
+    env = {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    warn("%s: skipping malformed line: %s" % (path, line))
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                    v = v[1:-1]
+                env[k] = v
+    except OSError as exc:
+        raise UserError("cannot read env file: %s" % exc)
+    return env
+
+
+def normalize_env(cfg_env):
+    out = {}
+    if isinstance(cfg_env, dict):
+        for k, v in cfg_env.items():
+            out[str(k)] = "" if v is None else str(v)
+    elif isinstance(cfg_env, list):
+        for item in cfg_env:
+            if "=" in str(item):
+                k, v = str(item).split("=", 1)
+                out[k] = v
+            else:
+                out[str(item)] = ""
+    return out
+
+
+def merge_dict(base, override):
+    out = dict(base)
+    for k, v in override.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = merge_dict(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def discover_compose_file(explicit, start_dir=None):
+    if explicit:
+        files = []
+        for f in explicit:
+            if f == "-":
+                files.append("-")
+                continue
+            if not os.path.exists(f):
+                raise UserError("no such file: %s" % f)
+            files.append(os.path.abspath(f))
+        base_dir = os.path.dirname(files[0]) if files[0] != "-" else os.getcwd()
+        return files, base_dir
+    d = os.path.abspath(start_dir or os.getcwd())
+    floor = d if start_dir else "/"
+    while True:
+        for name in COMPOSE_FILES:
+            p = os.path.join(d, name)
+            if os.path.exists(p):
+                return [os.path.abspath(p)], d
+        parent = os.path.dirname(d)
+        if parent == d or d == floor:
+            break
+        d = parent
+    where = "directory %s" % floor if start_dir \
+        else "%s or its parents" % os.getcwd()
+    raise UserError(
+        "no compose file found in %s (looked for: %s)"
+        % (where, ", ".join(COMPOSE_FILES))
+    )
+
+
+class Project:
+    def __init__(self, opts):
+        self.opts = opts
+        self.file_list, self.base_dir = discover_compose_file(
+            opts.get("file"), start_dir=opts.get("project_directory"))
+        self.project_dir = opts.get("project_directory") or self.base_dir
+        self.name = self._resolve_name(opts.get("project_name"))
+        self.variables = {}
+        host = dict(os.environ)
+        dot_env_path = os.path.join(self.project_dir, ".env")
+        if opts.get("env_file"):
+            self.variables.update(parse_env_file(opts["env_file"]))
+        elif os.path.exists(dot_env_path):
+            self.variables.update(parse_env_file(dot_env_path))
+        self.variables.update(host)
+        self.raw = self._load_raw()
+        self.config = deep_interp(self.raw, self.variables)
+        self.services = self._validate_services()
+
+    def _resolve_name(self, cli_name):
+        name = cli_name or os.environ.get("COMPOSE_PROJECT_NAME")
+        if not name:
+            for doc in self._raw_documents():
+                top = doc.get("name")
+                if top and isinstance(top, str):
+                    name = top
+        if not name:
+            name = os.path.basename(self.project_dir.rstrip("/")).lower()
+            name = re.sub(r"[^a-z0-9_-]", "", name)
+        if not PROJECT_RE.match(name or ""):
+            raise UserError(
+                "invalid project name: %r (must match %s); use -p to set one"
+                % (name, PROJECT_RE.pattern)
+            )
+        return name
+
+    def _read_file(self, path):
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def _raw_documents(self):
+        docs = []
+        for f in self.file_list:
+            src = sys.stdin.read() if f == "-" else self._read_file(f)
+            docs.append(yaml_load(src))
+        return docs
+
+    def _load_raw(self):
+        merged = {}
+        for doc in self._raw_documents():
+            if not isinstance(doc, dict):
+                raise UserError("compose file must be a mapping")
+            merged = merge_dict(merged, doc)
+        return merged
+
+    def active_profiles(self):
+        cli = set(self.opts.get("profiles") or [])
+        cli |= set(filter(None, os.environ.get("COMPOSE_PROFILES", "").split(",")))
+        return cli
+
+    def _validate_services(self):
+        svcs = self.config.get("services")
+        if not isinstance(svcs, dict) or not svcs:
+            raise UserError("compose file defines no services")
+        active = self.active_profiles()
+        out = {}
+        for name, cfg in svcs.items():
+            if cfg is None:
+                cfg = {}
+            if not isinstance(cfg, dict):
+                raise UserError('service "%s" must be a mapping' % name)
+            profs = cfg.get("profiles") or []
+            if isinstance(profs, str):
+                profs = [profs]
+            if profs and not (active & set(profs)):
+                continue
+            if "image" not in cfg and "build" not in cfg:
+                raise UserError(
+                    'service "%s" refers to undefined image (and build is unsupported by udocker)'
+                    % name
+                )
+            out[name] = cfg
+        if not out:
+            raise UserError(
+                "no services match the enabled profiles (%s)" % (", ".join(sorted(active)) or "none")
+            )
+        for svc, cfg in out.items():
+            deps = cfg.get("depends_on") or []
+            if isinstance(deps, dict):
+                deps = list(deps.keys())
+            for dep in deps:
+                if dep not in svcs:
+                    raise UserError(
+                        'service "%s" depends on undefined service "%s"'
+                        % (svc, dep)
+                    )
+                dep_profs = svcs[dep].get("profiles") or []
+                if dep_profs and not (active & set(dep_profs)):
+                    raise UserError(
+                        'service "%s" depends on "%s" whose profile is not enabled'
+                        % (svc, dep)
+                    )
+        return out
+
+    def ordered_services(self, targets=None, include_deps=True):
+        order, seen, visiting = [], set(), set()
+
+        def visit(name):
+            if name in seen:
+                return
+            if name in visiting:
+                raise UserError("dependency cycle detected involving '%s'" % name)
+            visiting.add(name)
+            deps = self.services[name].get("depends_on") or []
+            if isinstance(deps, dict):
+                deps = list(deps.keys())
+            if include_deps:
+                for dep in deps:
+                    if dep in self.services:
+                        visit(dep)
+                    else:
+                        raise UserError('service "%s" depends on disabled service "%s"' % (name, dep))
+            visiting.discard(name)
+            seen.add(name)
+            order.append(name)
+
+        targets = targets or list(self.services)
+        for t in targets:
+            if t not in self.services:
+                raise UserError("no such service: %s" % t)
+        for t in targets:
+            visit(t)
+        if not targets:
+            for s in self.services:
+                visit(s)
+        return order
+
+    def container_name(self, service, idx=1):
+        svc_cfg = self.services.get(service, {})
+        cname = svc_cfg.get("container_name")
+        if cname and idx == 1:
+            return str(cname)
+        if idx == 1:
+            return "%s_%s_1" % (self.name, service)
+        return "%s_%s_%d" % (self.name, service, idx)
+
+    def state_dir(self):
+        path = os.path.join(self.project_dir, STATE_DIRNAME)
+        os.makedirs(path, exist_ok=True)
+        os.makedirs(os.path.join(path, "logs"), exist_ok=True)
+        return path
+
+    def state_path(self):
+        return os.path.join(self.state_dir(), "state.json")
+
+
+def load_state(project):
+    try:
+        with open(project.state_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+        if data.get("project") != project.name:
+            return {"project": project.name, "services": {}}
+        data.setdefault("services", {})
+        return data
+    except (OSError, ValueError):
+        return {"project": project.name, "services": {}}
+
+
+def save_state(project, state):
+    tmp = project.state_path() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(state, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, project.state_path())
+
+
+def config_hash(svc_cfg):
+    relevant = {
+        k: svc_cfg.get(k)
+        for k in (
+            "image", "entrypoint", "command", "environment", "env_file",
+            "volumes", "working_dir", "user", "devices",
+        )
+        if k in svc_cfg
+    }
+    blob = json.dumps(relevant, sort_keys=True, default=str)
+    import hashlib
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+def pid_alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def container_running(entry):
+    return bool(entry.get("pid")) and pid_alive(entry["pid"])
+
+
+class Udocker:
+    def __init__(self, project, dry_run=False):
+        self.project = project
+        self.dry_run = dry_run
+        self.bin = os.environ.get("UCOMPOSE_UDOCKER", shutil.which("udocker") or "udocker")
+        self._entrypoint_supported = None
+
+    def _base(self):
+        argv = [self.bin]
+        if not sys.stdout.isatty() or os.environ.get("UCOMPOSE_QUIET_UDOCKER", "1") == "1":
+            argv.append("-q")
+        return argv
+
+    def call(self, args, capture=False, check=True, quiet=True, input=None):
+        argv = ([self.bin, "-q"] if quiet else [self.bin]) + list(args)
+        if self.dry_run:
+            print("[DRY-RUN] " + " ".join(shlex.quote(a) for a in argv))
+            class R:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return R()
+        proc = subprocess.run(
+            argv,
+            capture_output=capture,
+            stdin=None if input is None else subprocess.PIPE,
+            input=input,
+            text=True,
+        )
+        if check and proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            detail = tail[-1] if tail else ("exit %d" % proc.returncode)
+            raise UserError("udocker %s failed: %s" % (args[0], detail))
+        return proc
+
+    def spawn(self, args, log_path, extra_env=None):
+        if self.dry_run:
+            print("[DRY-RUN] spawn: udocker -q run " + " ".join(args))
+            return None
+        fh = open(log_path, "ab", buffering=0)
+        try:
+            proc = subprocess.Popen(
+                [self.bin, "-q", "run"] + list(args),
+                stdout=fh,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                env={**os.environ, **(extra_env or {})},
+            )
+        finally:
+            fh.close()
+        return proc
+
+    def image_exists(self, image):
+        out = self.call(["images"], capture=True).stdout
+        repos = [ln.split()[0] for ln in out.splitlines()[1:] if ln.split()]
+        base = image.split("@")[0]
+        for r in repos:
+            if r == base or r == base.rsplit(":", 1)[0] and ":" not in base:
+                return True
+        return base in repos or any(r.startswith(base + ":") for r in repos)
+
+    def pull(self, image, quiet_pull=True):
+        self.call(["pull", image], capture=quiet_pull, check=True, quiet=quiet_pull)
+        return True
+
+    def ensure_image(self, cfg, policy="missing"):
+        image = cfg["image"]
+        exists = self.image_exists(image)
+        if exists and policy == "always":
+            self.pull(image)
+            return True
+        if not exists:
+            if policy == "never":
+                raise UserError("image not present locally: %s (pull policy: never)" % image)
+            self.pull(image)
+            return True
+        return False
+
+    def container_exists(self, name):
+        if self.dry_run:
+            return False
+        return self.call(["inspect", name], capture=True, check=False).returncode == 0
+
+    def create_container(self, name, image):
+        if self.dry_run:
+            print("[DRY-RUN] udocker create --name=%s %s" % (shlex.quote(name), shlex.quote(image)))
+            return name
+        if self.container_exists(name):
+            raise UserError('container name already in use: "%s"' % name)
+        proc = self.call(["create", "--name=%s" % name, image], capture=True, check=False)
+        if proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            raise UserError('cannot create container "%s": %s' % (name, tail[-1] if tail else "unknown"))
+        return proc.stdout.strip().splitlines()[-1].strip()
+
+    def remove_container(self, name):
+        if self.dry_run:
+            print("[DRY-RUN] udocker rm -f %s" % shlex.quote(name))
+            return
+        if self.container_exists(name):
+            proc = self.call(["rm", "-f", name], capture=True, check=False)
+            if proc.returncode != 0:
+                tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+                warn('could not remove container "%s"%s' %
+                     (name, (": " + tail[-1]) if tail else ""))
+
+    def container_root(self, name):
+        proc = self.call(["inspect", "-p", name], capture=True, check=False)
+        lines = [l.strip() for l in (proc.stdout or "").splitlines() if l.strip()]
+        return lines[-1] if proc.returncode == 0 and lines else None
+
+    def entrypoint_flag_supported(self):
+        if self._entrypoint_supported is None:
+            try:
+                help_text = self.call(["run", "--help"], capture=True).stdout
+                self._entrypoint_supported = "entrypoint" in help_text
+            except UserError:
+                self._entrypoint_supported = False
+        return self._entrypoint_supported
+
+    def ps_containers(self):
+        out = self.call(["ps"], capture=True).stdout
+        rows = []
+        for ln in out.splitlines()[1:]:
+            parts = ln.split()
+            if len(parts) >= 5:
+                rows.append({"id": parts[0], "names": parts[3], "image": parts[4]})
+        return rows
+
+
+def resolve_volumes(project, svc_cfg):
+    resolved = []
+    ro_requested = False
+    top_vols = project.config.get("volumes") or {}
+    for vol in svc_cfg.get("volumes") or []:
+        parts = str(vol).split(":")
+        if len(parts) == 1:
+            src = dst = parts[0]
+            mode = ""
+        elif len(parts) == 2:
+            src, dst = parts
+            mode = ""
+        else:
+            src, dst, mode = parts[0], parts[1], parts[2]
+        if not src or not dst:
+            warn("skipping malformed volume: %s" % vol)
+            continue
+        if not src.startswith(("/", ".", "~")):
+            declared = top_vols.get(src) if isinstance(top_vols, dict) else None
+            if isinstance(declared, dict) and declared.get("external"):
+                loc = str(declared.get("name", src))
+                resolved.append("%s:%s" % (loc, dst))
+                continue
+            loc = os.path.join(project.state_dir(), "volumes", "%s_%s" % (project.name, src))
+            os.makedirs(loc, exist_ok=True)
+            src = loc
+        elif src.startswith(("~", ".")):
+            src = os.path.abspath(os.path.expanduser(src))
+        if src.startswith("/") and not os.path.isdir(src):
+            try:
+                os.makedirs(src, exist_ok=True)
+            except OSError:
+                warn("cannot create host directory for volume: %s" % src)
+        if "ro" in mode.split(","):
+            ro_requested = True
+        resolved.append("%s:%s" % (src, dst))
+    if ro_requested:
+        warn("read-only volumes requested; udocker execution modes cannot enforce read-only binds")
+    for dev in svc_cfg.get("devices") or []:
+        dparts = str(dev).split(":")
+        host = dparts[0]
+        cont = dparts[1] if len(dparts) > 1 else dparts[0]
+        resolved.append("%s:%s" % (host, cont))
+    return resolved
+
+
+def build_run_args(project, ud, svc_cfg, cmd_override=None, overrides=None):
+    ov = overrides or {}
+    args = []
+    env = {}
+    for ef in _as_list(svc_cfg.get("env_file")):
+        path = ef if os.path.isabs(ef) else os.path.join(project.project_dir, ef)
+        env.update(parse_env_file(path))
+    env.update(normalize_env(svc_cfg.get("environment")))
+    env.update(normalize_env(ov.get("env")))
+    for k, v in sorted(env.items()):
+        args.append('--env=%s=%s' % (k, v))
+    for vol in resolve_volumes(project, svc_cfg):
+        args.append("--volume=%s" % vol)
+    workdir = ov.get("workdir") or svc_cfg.get("working_dir")
+    if workdir:
+        args.append("--workdir=%s" % workdir)
+    user = ov.get("user") or svc_cfg.get("user")
+    if user:
+        args.append("--user=%s" % user)
+    entrypoint = ov.get("entrypoint", svc_cfg.get("entrypoint"))
+    cmd = cmd_override if cmd_override is not None else _as_list_or_str(svc_cfg.get("command"))
+    ep_list = _as_list_or_str(entrypoint) if entrypoint is not None else None
+    if ep_list:
+        if ov.get("force_entrypoint_prepend") or not ud.entrypoint_flag_supported():
+            cmd = ep_list + _as_list_or_str(cmd)
+            ep_list = None
+        else:
+            args.append("--entrypoint=" + " ".join(ep_list))
+    if isinstance(cmd, str):
+        cmd = shlex.split(cmd)
+    return args, (cmd or [])
+
+
+def _as_list(v):
+    if v is None:
+        return []
+    return [v] if isinstance(v, str) else list(v)
+
+
+def _as_list_or_str(v):
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return v
+    return list(v)
+
+
+SERVICE_ENV_KEY = "services"
+
+
+def service_ports_table(project):
+    rows = []
+    for svc in project.ordered_services():
+        for p in project.services[svc].get("ports") or []:
+            p = str(p)
+            if ":" in p:
+                host, rest = p.split(":", 1)
+                cont = rest.split("/")[0]
+                rows.append((svc, host, cont))
+            else:
+                rows.append((svc, "", p.split("/")[0]))
+    return rows
+
+
+def print_ports_notice(project):
+    rows = service_ports_table(project)
+    if not rows:
+        return
+    warn("udocker containers share the host network; port publishing is informational:")
+    for svc, host, cont in rows:
+        line = '  %-14s %s' % (svc, ("%s->%s" % (host, cont)) if host else ("exposed %s" % cont))
+        print(line)
+
+
+class Lifecycle:
+    def __init__(self, project, opts):
+        self.p = project
+        self.o = opts
+        self.ud = Udocker(project, dry_run=bool(opts.get("dry_run")))
+        self.state = load_state(project)
+        self.timeout = int(opts.get("timeout") or 10)
+
+    def key_for(self, svc, idx):
+        return svc if idx == 1 else "%s#%d" % (svc, idx)
+
+    def save(self):
+        save_state(self.p, self.state)
+
+    def entries_for(self, svc):
+        return [(k, e) for k, e in sorted(self.state["services"].items())
+                if e.get("service") == svc]
+
+    def recreate_needed(self, svc, idx, force, no_recreate):
+        name = self.p.container_name(svc, idx)
+        key = self.key_for(svc, idx)
+        entry = self.state["services"].get(key, {})
+        if force:
+            return True
+        if no_recreate:
+            return False
+        if not self.ud.container_exists(name):
+            return True
+        h = config_hash(self.p.services[svc])
+        return entry.get("hash") != h
+
+    def ensure_container(self, svc, idx, force=False, no_recreate=False):
+        name = self.p.container_name(svc, idx)
+        key = self.key_for(svc, idx)
+        cfg = self.p.services[svc]
+        if self.recreate_needed(svc, idx, force, no_recreate):
+            entry = self.state["services"].get(key, {})
+            if container_running(entry):
+                raise UserError(
+                    'container "%s" is running; stop it first or use --force-recreate'
+                    % name)
+            if self.ud.container_exists(name):
+                self.ud.remove_container(name)
+            if not self.ud.container_exists(name):
+                self.ud.create_container(name, cfg["image"])
+            self.state["services"][key] = {
+                "service": svc, "index": idx, "container": name,
+                "image": cfg["image"], "hash": config_hash(cfg),
+                "pid": None, "exit_code": None,
+            }
+            self.save()
+        return self.state["services"].setdefault(key, {
+            "service": svc, "index": idx, "container": name,
+            "image": cfg.get("image"), "pid": None, "exit_code": None,
+        })
+
+    def launch(self, svc, idx, log_path, overrides=None):
+        entry = self.ensure_container(svc, idx)
+        name = entry["container"]
+        args, cmd = build_run_args(self.p, self.ud, self.p.services[svc], overrides=overrides)
+        proc = self.ud.spawn(args + [name] + cmd, log_path)
+        entry["pid"] = proc.pid if proc else None
+        entry["exit_code"] = None
+        entry["started_at"] = time.time()
+        self.save()
+        return entry, proc
+
+    def stop_one(self, key, timeout=None, sig=signal.SIGTERM):
+        entry = self.state["services"].get(key)
+        if not entry:
+            return None
+        pid = entry.get("pid")
+        timeout = timeout if timeout is not None else self.timeout
+        rc = None
+        if pid and pid_alive(pid):
+            try:
+                pgid = os.getpgid(pid)
+                os.killpg(pgid, sig)
+            except (ProcessLookupError, PermissionError):
+                try:
+                    os.kill(pid, sig)
+                except OSError:
+                    pass
+            deadline = time.time() + max(timeout, 1)
+            while time.time() < deadline and pid_alive(pid):
+                time.sleep(0.15)
+            if pid_alive(pid):
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except OSError:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                time.sleep(0.2)
+            rc = self._reap(pid)
+        entry["pid"] = None
+        if rc is not None:
+            entry["exit_code"] = rc
+        self.save()
+        return rc
+
+    def _reap(self, pid):
+        for _ in range(20):
+            try:
+                wpid, status = os.waitpid(pid, os.WNOHANG)
+                if wpid == pid:
+                    if os.WIFEXITED(status):
+                        return os.WEXITSTATUS(status)
+                    if os.WIFSIGNALED(status):
+                        return 128 + os.WTERMSIG(status)
+            except ChildProcessError:
+                break
+            except OSError:
+                break
+            time.sleep(0.1)
+        return None
+
+
+def _registry_path():
+    return os.path.join(os.path.expanduser("~"), ".ucompose-registry.json")
+
+
+def registry_update(project):
+    try:
+        with open(_registry_path(), encoding="utf-8") as fh:
+            reg = json.load(fh)
+    except (OSError, ValueError):
+        reg = {}
+    reg[project.name] = {"dir": project.project_dir, "files": project.file_list,
+                         "ts": time.time()}
+    tmp = _registry_path() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(reg, fh, indent=2, sort_keys=True)
+    os.replace(tmp, _registry_path())
+
+
+def registry_load():
+    try:
+        with open(_registry_path(), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+GLOBAL_VAL = {"-f": "file", "--file": "file", "-p": "project_name",
+              "--project-name": "project_name", "--profile": "profiles",
+              "--project-directory": "project_directory",
+              "--env-file": "env_file", "--ansi": "ansi",
+              "--parallel": "parallel", "--log-level": "log_level"}
+GLOBAL_BOOL = {"--dry-run", "--compatibility", "--all-resources",
+               "--no-ansi", "--verbose", "--progress"}
+
+
+def parse_global(argv):
+    opts = {}
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "-H" or tok.startswith("--host"):
+            raise UserError("connecting to a remote docker host is impossible with udocker")
+        if tok in GLOBAL_VAL:
+            if "=" in tok:
+                tok, val = tok.split("=", 1)
+            else:
+                i += 1
+                if i >= len(argv):
+                    raise UserError("%s requires a value" % tok)
+                val = argv[i]
+            key = GLOBAL_VAL[tok]
+            if key in ("file", "profiles"):
+                opts.setdefault(key, []).extend(val.split(","))
+            else:
+                opts[key] = val
+        elif tok in GLOBAL_BOOL:
+            tok = tok.split("=", 1)[0]
+            opts[tok.lstrip("-").replace("-", "_")] = True
+            if tok == "--no-ansi":
+                opts["ansi"] = "never"
+        elif tok.startswith("-"):
+            raise UserError("unknown global option: %s" % tok)
+        else:
+            return opts, argv[i:]
+        i += 1
+    return opts, []
+
+
+class FlagSpec:
+    def __init__(self):
+        self.bools, self.vals, self.multis = {}, {}, {}
+        self.raw_after = 0
+
+    def raw(self, n=1):
+        self.raw_after = n
+        return self
+
+    def _bind(self, table, names):
+        longs = [n for n in names if n.startswith("--")]
+        for n in names:
+            if n.startswith("--"):
+                table[n] = n[2:].replace("-", "_")
+                continue
+            letter = n.lstrip("-")
+            matches = [l for l in longs
+                       if l[2:].startswith(letter)]
+            if len(matches) == 1:
+                table[n] = matches[0][2:].replace("-", "_")
+            else:
+                table[n] = n.lstrip("-").replace("-", "_")
+
+    def b(self, *names):
+        self._bind(self.bools, names)
+        return self
+
+    def v(self, *names):
+        self._bind(self.vals, names)
+        return self
+
+    def m(self, *names):
+        self._bind(self.multis, names)
+        return self
+
+
+def take_flags(tokens, spec):
+    out = {"_pos": []}
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        eq = None
+        if tok.startswith("--") and "=" in tok:
+            tok, eq = tok.split("=", 1)
+        if tok in spec.bools:
+            out[spec.bools[tok]] = True
+        elif tok in spec.vals:
+            val = eq if eq is not None else (
+                tokens[i + 1] if i + 1 < len(tokens) else None)
+            if val is None:
+                raise UserError("%s requires a value" % tok)
+            if eq is None:
+                i += 1
+            out[spec.vals[tok]] = val
+        elif tok in spec.multis:
+            val = eq if eq is not None else (
+                tokens[i + 1] if i + 1 < len(tokens) else None)
+            if val is None:
+                raise UserError("%s requires a value" % tok)
+            if eq is None:
+                i += 1
+            out.setdefault(spec.multis[tok], []).append(val)
+        elif tok.startswith("-") and len(tok) > 1 and tok[1] != "-" and \
+                all(("-" + c) in spec.bools for c in tok[1:]):
+            for c in tok[1:]:
+                out[spec.bools["-" + c]] = True
+        elif tok == "--":
+            out["_pos"].extend(tokens[i + 1:])
+            break
+        elif spec.raw_after and len(out["_pos"]) >= spec.raw_after:
+            out["_pos"].append(tok)
+        elif tok.startswith("-") and len(tok) > 1:
+            raise UserError("unknown option: %s" % tok)
+        else:
+            out["_pos"].append(tok)
+        i += 1
+    return out
+
+
+def scale_overrides(flags):
+    scales = {}
+    for item in flags.get("scale", []):
+        if "=" not in item:
+            raise UserError("--scale expects SERVICE=NUM, got: %s" % item)
+        svc, num = item.rsplit("=", 1)
+        try:
+            scales[svc] = max(0, int(num))
+        except ValueError:
+            raise UserError("--scale expects SERVICE=NUM, got: %s" % item)
+    return scales
+
+
+def log_path_for(project, key):
+    safe = re.sub(r"[^A-Za-z0-9_.#-]", "_", key)
+    return os.path.join(project.state_dir(), "logs", safe + ".log")
+
+
+def launch_set(lc, svcs, scales, quiet_start=False):
+    launched = []
+    for svc in svcs:
+        if svc in scales and scales[svc] == 0:
+            continue
+        n = scales.get(svc, int(lc.p.services[svc].get("scale") or 1))
+        for idx in range(1, n + 1):
+            key = lc.key_for(svc, idx)
+            entry, proc = lc.launch(svc, idx, log_path_for(lc.p, key))
+            launched.append((svc, idx, entry))
+            print("Container %s  Started%s" %
+                  (lc.p.container_name(svc, idx), "" if proc else " [dry-run]"))
+    return launched
+
+
+UP_SPEC = FlagSpec().b("-d", "--detach", "--force-recreate", "--no-recreate",
+                       "--no-deps", "--no-start", "--build", "--quiet-pull",
+                       "--wait", "--abort-on-container-exit",
+                       "--abort-on-container-failure", "--no-log-prefix",
+                       "--renew-anon-volumes") \
+    .v("--pull", "--exit-code-from", "--wait-timeout", "-t", "--timeout") \
+    .m("--scale")
+
+
+DOWN_SPEC = FlagSpec().b("-v", "--volumes", "--remove-orphans") \
+    .v("-t", "--timeout", "--rmi")
+
+
+def cmd_up(opts, flags):
+    p = Project(opts)
+    registry_update(p)
+    lc = Lifecycle(p, opts)
+    if flags.get("build"):
+        raise UserError("image building is not possible with udocker; use prebuilt images")
+    svcs = p.ordered_services(flags["_pos"], include_deps=not flags.get("no_deps"))
+    scales = scale_overrides(flags)
+    for svc in scales:
+        if svc not in p.services:
+            raise UserError("no such service: %s" % svc)
+    for svc in svcs:
+        warn_unsupported(svc, p.services[svc])
+        lc.ud.ensure_image(p.services[svc], policy=flags.get("pull", "missing"))
+    if flags.get("renew_anon_volumes"):
+        warn("--renew-anon-volumes: no anonymous volumes exist under udocker")
+    force = flags.get("force_recreate")
+    no_recreate = flags.get("no_recreate")
+    if force and no_recreate:
+        raise UserError("--force-recreate and --no-recreate are incompatible")
+    print_ports_notice(p)
+    targets = []
+    for svc in svcs:
+        n = scales.get(svc, int(p.services[svc].get("scale") or 1))
+        if n == 0:
+            continue
+        targets.extend((svc, idx) for idx in range(1, n + 1))
+    if not flags.get("no_start"):
+        for svc, idx in targets:
+            key = lc.key_for(svc, idx)
+            entry = lc.state["services"].get(key, {})
+            if not container_running(entry):
+                lc.ensure_container(svc, idx, force=force, no_recreate=no_recreate)
+        launched = launch_set(lc, [s for s, _ in targets], scales)
+    else:
+        launched = []
+
+    if flags.get("detach") or flags.get("no_start") or not launched:
+        if flags.get("wait") and launched:
+            deadline = time.time() + int(flags.get("wait_timeout") or 60)
+            while time.time() < deadline:
+                running = {k for k, e in lc.state["services"].items()
+                           if container_running(e)}
+                wanted = {lc.key_for(s, i) for s, i in targets}
+                if wanted <= running:
+                    break
+                for k in wanted - running:
+                    e = lc.state["services"].get(k, {})
+                    if e.get("pid") and not pid_alive(e["pid"]):
+                        die('service "%s" exited during --wait' % k)
+                time.sleep(0.4)
+        return 0
+
+    exit_from = flags.get("exit_code_from")
+    if exit_from:
+        flags["abort_on_container_exit"] = True
+        if exit_from not in p.services:
+            raise UserError("no such service: %s" % exit_from)
+    if (flags.get("abort_on_container_exit") or
+            flags.get("abort_on_container_failure")) and flags.get("detach"):
+        raise UserError("--abort-on-container-exit is incompatible with -d")
+
+    tails = {lc.key_for(s, i): [log_path_for(p, lc.key_for(s, i)), 0]
+             for s, i in targets}
+    remaining = set(tails)
+    codes = {}
+    interrupt = {"hit": 0}
+
+    def onint(signum, frame):
+        interrupt["hit"] += 1
+
+    old = signal.signal(signal.SIGINT, onint)
+    try:
+        handles = {}
+        while remaining and not interrupt["hit"]:
+            progressed = False
+            for key in list(tails):
+                path, pos = tails[key][0], tails[key][1]
+                try:
+                    fh = handles.setdefault(key, open(path, "rb"))
+                except OSError:
+                    continue
+                fh.seek(pos)
+                chunk = fh.read()
+                if chunk:
+                    progressed = True
+                    tails[key][1] = pos + len(chunk)
+                    prefix = "" if flags.get("no_log_prefix") else \
+                        "%-16s | " % key
+                    ts = time.strftime("%H:%M:%S ") if flags.get("timestamps") else ""
+                    for line in chunk.decode("utf-8", "replace").splitlines():
+                        sys.stdout.write(prefix + ts + line + "\n")
+                    sys.stdout.flush()
+            for key in list(remaining):
+                e = lc.state["services"].get(key, {})
+                pid = e.get("pid")
+                if pid and not pid_alive(pid):
+                    rc = lc._reap(pid)
+                    if rc is None:
+                        rc = 0
+                    e["exit_code"] = rc
+                    codes[key] = rc
+                    remaining.discard(key)
+                    if flags.get("abort_on_container_exit") or \
+                            (flags.get("abort_on_container_failure") and rc != 0):
+                        interrupt["hit"] = interrupt["hit"] or 2
+            if not progressed:
+                time.sleep(0.15)
+
+        if interrupt["hit"]:
+            print("\nAborting on container exit..." if interrupt["hit"] > 1
+                  else "\nGracefully stopping... (press Ctrl-C again to force)")
+            tmo = int(flags.get("timeout") or 10)
+            for key in sorted(lc.state["services"], reverse=True):
+                if key not in codes:
+                    lc.stop_one(key, timeout=tmo)
+            return 130 if interrupt["hit"] == 1 else (
+                int(codes.get(next(iter(codes), 0), 0)) if codes else 1)
+    finally:
+        signal.signal(signal.SIGINT, old)
+
+    lc.save()
+    if exit_from:
+        for k, c in codes.items():
+            if k.split("#")[0] == exit_from:
+                return int(c or 0)
+        raise UserError('service "%s" did not produce an exit code' % exit_from)
+    failed = [c for c in codes.values() if c not in (None, 0)]
+    if failed and flags.get("abort_on_container_failure"):
+        return int(failed[0])
+    return 0
+
+
+def cmd_down(opts, flags):
+    p = Project(opts)
+    lc = Lifecycle(p, opts)
+    timeout = int(flags.get("timeout") or 10)
+    svcs = p.ordered_services(flags["_pos"])
+    removed = False
+    for svc in reversed(svcs):
+        for idx in range(8, 0, -1):
+            key = lc.key_for(svc, idx)
+            entry = lc.state["services"].get(key)
+            if not entry:
+                continue
+            lc.stop_one(key, timeout=timeout)
+            lc.ud.remove_container(entry["container"])
+            print("Container %s  Removed" % entry["container"])
+            lc.state["services"].pop(key, None)
+            removed = True
+    lc.save()
+    if flags.get("rmi"):
+        for svc in svcs:
+            img = p.services[svc].get("image")
+            if img:
+                proc = lc.ud.call(["rmi", img], capture=True, check=False)
+                if proc.returncode == 0:
+                    print('Image "%s"  Removed' % img)
+    if flags.get("volumes"):
+        top = p.config.get("volumes") or {}
+        volroot = os.path.join(p.state_dir(), "volumes")
+        for vname, decl in top.items() if isinstance(top, dict) else []:
+            if isinstance(decl, dict) and decl.get("external"):
+                continue
+            d = os.path.join(volroot, "%s_%s" % (p.name, vname))
+            if os.path.isdir(d):
+                shutil.rmtree(d, ignore_errors=True)
+                print('Volume "%s"  Removed' % vname)
+    if flags.get("remove_orphans"):
+        expected = {p.container_name(s) for s in p.services}
+        for row in lc.ud.ps_containers():
+            nm = row["names"]
+            if nm.startswith(p.name + "_") and nm not in expected:
+                lc.ud.remove_container(nm)
+                print("Orphan %s  Removed" % nm)
+    return 0
+
+
+STOP_SPEC = FlagSpec().v("-t", "--timeout")
+
+
+def cmd_stop(opts, flags):
+    p = Project(opts)
+    lc = Lifecycle(p, opts)
+    svcs = p.ordered_services(flags["_pos"] or None)
+    tmo = int(flags.get("timeout") or 10)
+    for svc in reversed(svcs):
+        for key, entry in reversed(lc.entries_for(svc)):
+            if entry.get("pid") and pid_alive(entry["pid"]):
+                lc.stop_one(key, timeout=tmo)
+                print("Container %s  Stopped" % entry["container"])
+    return 0
+
+
+KILL_SPEC = FlagSpec().v("-s", "--signal")
+
+
+def cmd_kill(opts, flags):
+    p = Project(opts)
+    lc = Lifecycle(p, opts)
+    signame = str(flags.get("signal", "SIGKILL")).upper()
+    if not signame.startswith("SIG"):
+        signame = "SIG" + signame
+    try:
+        sig = getattr(signal, signame)
+    except AttributeError:
+        raise UserError("unknown signal: %s" % flags.get("signal"))
+    svcs = p.ordered_services(flags["_pos"] or None)
+    for svc in reversed(svcs):
+        for key, entry in reversed(lc.entries_for(svc)):
+            if entry.get("pid") and pid_alive(entry["pid"]):
+                lc.stop_one(key, timeout=0, sig=sig)
+                print("Container %s  Killed" % entry["container"])
+    return 0
+
+
+def cmd_start(opts, flags):
+    p = Project(opts)
+    registry_update(p)
+    lc = Lifecycle(p, opts)
+    svcs = p.ordered_services(flags["_pos"] or None)
+    missing = [s for s in svcs
+               if not any(k.split("#")[0] == s for k in lc.state["services"])]
+    if missing:
+        raise UserError(
+            "no containers created for: %s (run 'ucompose create' first)"
+            % ", ".join(missing))
+    for svc in svcs:
+        for idx in range(1, int(p.services[svc].get("scale") or 1) + 1):
+            key = lc.key_for(svc, idx)
+            entry = lc.state["services"].get(key)
+            if entry and not container_running(entry):
+                lc.launch(svc, idx, log_path_for(p, key))
+                print("Container %s  Started" % entry["container"])
+    return 0
+
+
+RESTART_SPEC = FlagSpec().v("-t", "--timeout").b("--no-deps")
+
+
+def cmd_restart(opts, flags):
+    p = Project(opts)
+    lc = Lifecycle(p, opts)
+    svcs = p.ordered_services(flags["_pos"] or None)
+    tmo = int(flags.get("timeout") or 10)
+    for svc in reversed(svcs):
+        for key, entry in reversed(lc.entries_for(svc)):
+            lc.stop_one(key, timeout=tmo)
+    for svc in svcs:
+        for idx in range(1, int(p.services[svc].get("scale") or 1) + 1):
+            key = lc.key_for(svc, idx)
+            if key in lc.state["services"]:
+                lc.launch(svc, idx, log_path_for(p, key))
+                print("Container %s  Started" % lc.state["services"][key]["container"])
+    return 0
+
+
+CREATE_SPEC = FlagSpec().b("--force-recreate", "--no-recreate", "-y", "--yes",
+                           "--quiet-pull", "--no-build", "--build",
+                           "--remove-orphans").v("--pull").m("--scale")
+
+
+def cmd_create(opts, flags):
+    p = Project(opts)
+    registry_update(p)
+    lc = Lifecycle(p, opts)
+    svcs = p.ordered_services(flags["_pos"])
+    scales = scale_overrides(flags)
+    for svc in svcs:
+        warn_unsupported(svc, p.services[svc])
+        lc.ud.ensure_image(p.services[svc], policy=flags.get("pull", "missing"))
+        n = scales.get(svc, int(p.services[svc].get("scale") or 1))
+        for idx in range(1, n + 1):
+            entry = lc.ensure_container(svc, idx,
+                                        force=flags.get("force_recreate"),
+                                        no_recreate=flags.get("no_recreate"))
+            print("Container %s  Created" % entry["container"])
+    return 0
+
+
+RM_SPEC = FlagSpec().b("-f", "--force", "-s", "--stop", "-v", "--volumes")
+
+
+def cmd_rm_cmd(opts, flags):
+    p = Project(opts)
+    lc = Lifecycle(p, opts)
+    svcs = p.ordered_services(flags["_pos"] or None)
+    doomed = []
+    for svc in svcs:
+        for key, entry in lc.entries_for(svc):
+            if container_running(entry):
+                if not flags.get("stop"):
+                    warn('skipping "%s": still running (use --stop)' %
+                         entry["container"])
+                    continue
+                lc.stop_one(key)
+            doomed.append((key, entry))
+    if not doomed:
+        return 0
+    if not flags.get("force"):
+        names = ", ".join(e["container"] for _, e in doomed)
+        ans = input("Going to remove %s. Are you sure? [yN] " % names)
+        if ans.strip().lower() not in ("y", "yes"):
+            return 0
+    for key, entry in doomed:
+        lc.ud.remove_container(entry["container"])
+        lc.state["services"].pop(key, None)
+        print("Container %s  Removed" % entry["container"])
+    lc.save()
+    return 0
+
+
+PULL_SPEC = FlagSpec().b("-q", "--quiet", "--include-deps").v("--policy")
+
+
+def cmd_pull(opts, flags):
+    p = Project(opts)
+    ud = Udocker(p, dry_run=bool(opts.get("dry_run")))
+    svcs = p.ordered_services(flags["_pos"])
+    policy = flags.get("policy", "always")
+    quiet = bool(flags.get("quiet"))
+    for svc in svcs:
+        img = p.services[svc].get("image")
+        if not img:
+            warn('service "%s" has no image to pull' % svc)
+            continue
+        changed = ud.ensure_image(p.services[svc], policy=policy)
+        if not quiet:
+            print('Image "%s"%s' % (img, "  Pulled" if changed else " up-to-date"))
+    return 0
+
+
+RUN_SPEC = FlagSpec().b("-d", "--detach", "--rm", "--no-deps", "-T",
+                        "--quiet", "-q").v("--entrypoint", "--name",
+                                           "-u", "--user", "-w", "--workdir",
+                                           "--pull").m("-e", "--env",
+                                                       "-v", "--volume").raw(1)
+
+
+def cmd_run(opts, flags):
+    p = Project(opts)
+    registry_update(p)
+    pos = flags["_pos"]
+    if not pos:
+        raise UserError("usage: ucompose run [OPTIONS] SERVICE [COMMAND] [ARGS...]")
+    svc = pos[0]
+    if svc not in p.services:
+        raise UserError("no such service: %s" % svc)
+    lc = Lifecycle(p, opts)
+    cfg = p.services[svc]
+    warn_unsupported(svc, cfg)
+    if not flags.get("no_deps"):
+        deps = p.ordered_services([svc])[:-1] if len(p.ordered_services([svc])) > 1 else []
+        for dep in deps:
+            dep_key = lc.key_for(dep, 1)
+            entry = lc.state["services"].get(dep_key)
+            if not entry or not container_running(entry):
+                lc.ensure_container(dep, 1)
+                lc.launch(dep, 1, log_path_for(p, dep_key))
+    ov = {"env": flags.get("env"), "user": flags.get("user"),
+          "workdir": flags.get("workdir"), "entrypoint": flags.get("entrypoint")}
+    args, base_cmd = build_run_args(p, lc.ud, cfg, overrides=ov)
+    extra_vols = []
+    for vol in flags.get("volume", []):
+        parts = str(vol).split(":")
+        if parts[0].startswith((".", "~")):
+            parts[0] = os.path.abspath(os.path.expanduser(parts[0]))
+        extra_vols.append("--volume=" + ":".join(parts))
+    cmd = pos[1:] if len(pos) > 1 else (
+        base_cmd if isinstance(base_cmd, list) else shlex.split(base_cmd))
+    one_off = flags.get("name") or "%s_%s_run_%s" % (p.name, svc, os.urandom(3).hex())
+    lc.ud.ensure_image(cfg)
+    if lc.ud.container_exists(one_off):
+        lc.ud.remove_container(one_off)
+    lc.ud.create_container(one_off, cfg["image"])
+    args, base_cmd = build_run_args(p, lc.ud, cfg, overrides=ov)
+    cmd = pos[1:] if len(pos) > 1 else (
+        base_cmd if isinstance(base_cmd, list) else shlex.split(base_cmd))
+    rc_args = args + extra_vols + [one_off] + cmd
+    if flags.get("detach"):
+        lc.ud.spawn(rc_args, log_path_for(p, one_off))
+        print(one_off)
+        return 0
+    argv = [lc.ud.bin, "-q", "run"] + rc_args
+    rc = subprocess.call(argv)
+    if flags.get("rm"):
+        lc.ud.remove_container(one_off)
+    return rc
+
+
+EXEC_SPEC = FlagSpec().b("-d", "--detach", "-T", "--privileged") \
+    .v("-u", "--user", "-w", "--workdir", "--index").m("-e", "--env").raw(1)
+
+
+def cmd_exec(opts, flags):
+    p = Project(opts)
+    lc = Lifecycle(p, opts)
+    pos = flags["_pos"]
+    if len(pos) < 2:
+        raise UserError("usage: ucompose exec [OPTIONS] SERVICE COMMAND [ARGS...]")
+    svc = pos[0]
+    if svc not in p.services:
+        raise UserError("no such service: %s" % svc)
+    key = lc.key_for(svc, int(flags.get("index") or 1))
+    entry = lc.state["services"].get(key)
+    if not entry or not container_running(entry):
+        raise UserError('service "%s" is not running' % svc)
+    ov = {"env": flags.get("env"), "user": flags.get("user"),
+          "workdir": flags.get("workdir")}
+    args, _ = build_run_args(p, lc.ud, {}, overrides=ov)
+    run_args = args + [entry["container"]] + pos[1:]
+    if flags.get("detach"):
+        lc.ud.spawn(run_args, log_path_for(p, key + ".exec"))
+        print(entry["container"])
+        return 0
+    return subprocess.call([lc.ud.bin, "-q", "run"] + run_args)
+
+
+PS_SPEC = FlagSpec().b("-a", "--all", "-q", "--quiet", "--no-trunc",
+                       "--services").v("--format", "--filter", "--status")
+
+
+def _status_of(entry, ud=None):
+    if container_running(entry):
+        return "running"
+    if entry.get("exit_code") is not None:
+        return "exited (%d)" % entry["exit_code"]
+    if entry.get("pid"):
+        return "exited (?)"
+    return "created"
+
+
+def cmd_ps(opts, flags):
+    p = Project(opts)
+    lc = Lifecycle(p, opts)
+    svcs = p.ordered_services(flags["_pos"] or None)
+    fmt = flags.get("format", "table")
+    rows = []
+    for svc in svcs:
+        for key, e in sorted(lc.entries_for(svc)):
+            status = _status_of(e)
+            if not flags.get("all") and status.split(" ")[0] != "running":
+                continue
+            if flags.get("status") and \
+                    flags["status"] != ("running" if status == "running" else "exited"):
+                continue
+            rows.append({
+                "Name": e["container"], "Image": e.get("image", ""),
+                "Service": svc, "State": status,
+            })
+    if flags.get("services"):
+        for s in svcs:
+            print(s)
+        return 0
+    if flags.get("quiet"):
+        for r in rows:
+            print(r["Name"])
+        return 0
+    if fmt == "json":
+        for r in rows:
+            print(json.dumps(r))
+        return 0
+    if fmt not in ("table", "pretty"):
+        raise UserError("unsupported --format: %s (use table|json)" % fmt)
+    hdr = "%-28s %-22s %-12s %s"
+    print(hdr % ("NAME", "IMAGE", "SERVICE", "STATUS"))
+    for r in rows:
+        name = r["Name"] if flags.get("no_trunc") else r["Name"][:26]
+        img = r["Image"] if flags.get("no_trunc") else r["Image"][:20]
+        print(hdr % (name, img, r["Service"], r["State"]))
+    return 0
+
+
+LOGS_SPEC = FlagSpec().b("-f", "--follow", "--no-color", "--no-log-prefix",
+                         "-t", "--timestamps").v("-n", "--tail", "--since",
+                                                 "--until", "--index")
+
+
+def cmd_logs(opts, flags):
+    p = Project(opts)
+    lc = Lifecycle(p, opts)
+    svcs = p.ordered_services(flags["_pos"] or None)
+    n_tail = flags.get("tail")
+    n_tail = None if n_tail in (None, "all") else max(0, int(n_tail))
+    prefix = not flags.get("no_log_prefix")
+    ts = bool(flags.get("timestamps"))
+    files = []
+    for svc in svcs:
+        n = max(1, int(p.services[svc].get("scale") or 1))
+        keys = [lc.key_for(svc, i + 1) for i in range(n)]
+        for k in keys:
+            lp = log_path_for(p, k)
+            if os.path.exists(lp):
+                files.append((k, lp))
+    width = max((len(k) for k, _ in files), default=0)
+    for k, lp in files:
+        with open(lp, "rb") as fh:
+            data = fh.read().decode("utf-8", "replace")
+        lines = data.splitlines()
+        if n_tail is not None:
+            lines = lines[-n_tail:] if n_tail else []
+        pre = ("%-*s | " % (width, k)) if prefix else ""
+        for line in lines:
+            stamp = time.strftime("%Y-%m-%dT%H:%M:%S ") if ts else ""
+            print(pre + stamp + line)
+        sys.stdout.flush()
+    if flags.get("follow"):
+        pos = {k: os.path.getsize(lp) for k, lp in files}
+        try:
+            while True:
+                for k, lp in files:
+                    size = os.path.getsize(lp)
+                    if size > pos[k]:
+                        with open(lp, "rb") as fh:
+                            fh.seek(pos[k])
+                            chunk = fh.read(size - pos[k])
+                        pos[k] = size
+                        pre = ("%-*s | " % (width, k)) if prefix else ""
+                        for line in chunk.decode("utf-8", "replace").splitlines():
+                            print(pre + line)
+                        sys.stdout.flush()
+                time.sleep(0.3)
+        except KeyboardInterrupt:
+            return 0
+    return 0
+
+
+TOP_SPEC = FlagSpec()
+
+
+def proc_tree(pid):
+    out = []
+    kids = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return out
+    for d in entries:
+        if not d.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % d) as fh:
+                parts = fh.read().rsplit(")", 1)[1].split()
+            ppid = int(parts[1])
+            kids.setdefault(ppid, []).append(int(d))
+        except (OSError, ValueError, IndexError):
+            continue
+
+    def walk(node, depth=0):
+        try:
+            with open("/proc/%d/cmdline" % node, "rb") as fh:
+                cmd = fh.read().replace(b"\x00", b" ").decode().strip() or "[?]"
+            with open("/proc/%d/stat" % node) as fh:
+                stat = fh.read().rsplit(")", 1)[1].split()
+            uid = os.stat("/proc/%d" % node).st_uid
+            import pwd
+            try:
+                user = pwd.getpwuid(uid).pw_name
+            except KeyError:
+                user = str(uid)
+            out.append((user, node, stat[1], cmd))
+        except (OSError, IndexError):
+            pass
+        for ch in sorted(kids.get(node, [])):
+            walk(ch, depth + 1)
+
+    walk(pid)
+    return out
+
+
+def cmd_top(opts, flags):
+    p = Project(opts)
+    lc = Lifecycle(p, opts)
+    svcs = p.ordered_services(flags["_pos"] or None)
+    any_running = False
+    for svc in svcs:
+        for key, e in lc.entries_for(svc):
+            if not container_running(e):
+                continue
+            any_running = True
+            print(e["container"])
+            print("%-10s %-7s %-7s %s" % ("UID", "PID", "PPID", "CMD"))
+            procs = proc_tree(e["pid"])
+            root_ppid = procs[0][2] if procs else "0"
+            for user, pid, ppid, cmdl in procs:
+                print("%-10s %-7s %-7s %s" % (user, pid, ppid, cmdl[:80]))
+    if not any_running:
+        warn("no running services")
+    return 0
+
+
+IMAGES_SPEC = FlagSpec().b("-q", "--quiet").v("--format")
+
+
+def cmd_images(opts, flags):
+    p = Project(opts)
+    lc = Lifecycle(p, opts)
+    imgs = {}
+    for key, e in sorted(lc.state["services"].items()):
+        if e.get("image"):
+            imgs[e["image"]] = imgs.get(e["image"], 0) + 1
+    fmt = flags.get("format", "table")
+    if flags.get("quiet"):
+        for img in imgs:
+            print(img)
+        return 0
+    if fmt == "json":
+        print(json.dumps([{"Repository": i, "Tag": "", "Containers": c}
+                          for i, c in imgs.items()], indent=2))
+        return 0
+    if fmt != "table":
+        raise UserError("unsupported --format: %s" % fmt)
+    print("%-30s %-10s %s" % ("REPOSITORY", "TAG", "CONTAINERS"))
+    for img, cnt in imgs.items():
+        repo, _, tag = img.partition(":")
+        print("%-30s %-10s %s" % (repo, tag or "latest", cnt))
+    return 0
+
+
+PORT_SPEC = FlagSpec().v("--protocol", "--index")
+
+
+def cmd_port(opts, flags):
+    p = Project(opts)
+    pos = flags["_pos"]
+    if len(pos) < 2:
+        raise UserError("usage: ucompose port SERVICE PRIVATE_PORT[/PROTO]")
+    svc, priv = pos[0], str(pos[1]).split("/")[0]
+    proto = flags.get("protocol", "tcp")
+    for s, host, cont in service_ports_table(p):
+        if s == svc and cont == priv:
+            print(host)
+            return 0
+    return 1
+
+
+WAIT_SPEC = FlagSpec().b("--down-project")
+
+
+def cmd_wait(opts, flags):
+    p = Project(opts)
+    lc = Lifecycle(p, opts)
+    targets = flags["_pos"]
+    keys = set()
+    for svc in (targets or [e["service"] for e in lc.state["services"].values()]):
+        for key, e in lc.entries_for(svc):
+            keys.add(key)
+    codes = {}
+    while keys:
+        for key in list(keys):
+            e = lc.state["services"].get(key, {})
+            pid = e.get("pid")
+            if pid is None:
+                keys.discard(key)
+                codes[key] = e.get("exit_code", 0)
+            elif not pid_alive(pid):
+                rc = lc._reap(pid)
+                codes[key] = rc if rc is not None else 0
+                keys.discard(key)
+        if keys:
+            time.sleep(0.4)
+    lc.save()
+    if flags.get("down_project"):
+        cmd_down(opts, FlagSpec())
+    failed = [c for c in codes.values() if c]
+    return int(failed[0]) if failed else 0
+
+
+LS_SPEC = FlagSpec().b("-a", "--all", "-q", "--quiet").v("--format")
+
+
+def cmd_ls(opts, flags):
+    reg = registry_load()
+    rows = []
+    for name, info in sorted(reg.items()):
+        state_path = os.path.join(info["dir"], STATE_DIRNAME, "state.json")
+        try:
+            with open(state_path, encoding="utf-8") as fh:
+                st = json.load(fh)
+            running = sum(1 for e in st.get("services", {}).values()
+                          if container_running(e))
+            cfg_n = len(st.get("services", {}))
+        except (OSError, ValueError):
+            running, cfg_n = 0, 0
+        if not flags.get("all") and running == 0 and cfg_n == 0:
+            continue
+        rows.append({"Name": name, "Status": "running(%d)" % running if running else "exited",
+                     "ConfigFiles": ", ".join(os.path.basename(f) for f in info["files"])})
+    if flags.get("quiet"):
+        for r in rows:
+            print(r["Name"])
+        return 0
+    fmt = flags.get("format", "table")
+    if fmt == "json":
+        print(json.dumps(rows, indent=2))
+        return 0
+    print("%-20s %-14s %s" % ("NAME", "STATUS", "CONFIGFILES"))
+    for r in rows:
+        print("%-20s %-14s %s" % (r["Name"], r["Status"], r["ConfigFiles"]))
+    return 0
+
+
+EVENTS_SPEC = FlagSpec().b("--json").v("--since", "--until")
+
+
+def cmd_events(opts, flags):
+    p = Project(opts)
+    lc = Lifecycle(p, opts)
+    seen = set()
+
+    def emit(action, key, e):
+        if flags.get("json"):
+            print(json.dumps({"time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                              "type": "container", "action": action,
+                              "id": e.get("container", ""),
+                              "service": key, "attributes": {"name": e.get("container", "")}}))
+        else:
+            print("container %s %s (service=%s)" % (action, e.get("container", ""), key))
+        sys.stdout.flush()
+
+    for key, e in lc.state["services"].items():
+        emit("create", key, e)
+        if container_running(e):
+            emit("start", key, e)
+            seen.add(key)
+    try:
+        while True:
+            alive = set()
+            for key, e in lc.state["services"].items():
+                if container_running(e):
+                    alive.add(key)
+                    if key not in seen:
+                        emit("start", key, e)
+                        seen.add(key)
+            for key in seen - alive:
+                e = lc.state["services"].get(key, {})
+                emit("die", key, e)
+                seen.discard(key)
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        return 0
+
+
+PAUSE_SPEC = FlagSpec()
+
+
+def cmd_pause(opts, flags):
+    p = Project(opts)
+    lc = Lifecycle(p, opts)
+    for svc in p.ordered_services(flags["_pos"] or None):
+        for key, e in lc.entries_for(svc):
+            if container_running(e):
+                os.killpg(os.getpgid(e["pid"]), signal.SIGSTOP)
+                print("Container %s  Paused" % e["container"])
+    return 0
+
+
+def cmd_unpause(opts, flags):
+    p = Project(opts)
+    lc = Lifecycle(p, opts)
+    for svc in p.ordered_services(flags["_pos"] or None):
+        for key, e in lc.entries_for(svc):
+            if e.get("pid") and pid_alive(e["pid"]):
+                os.killpg(os.getpgid(e["pid"]), signal.SIGCONT)
+                print("Container %s  Unpaused" % e["container"])
+    return 0
+
+
+CP_SPEC = FlagSpec().b("-a", "--archive", "-L", "--follow-link").v("--index")
+
+
+def _yaml_scalar(v):
+    s = "" if v is None else str(v)
+    if s != "" and re.match(r"^[\w./:@=+ -]+$", s) and s.strip() == s \
+            and isinstance(_parse_scalar(s), str) and _parse_scalar(s) == s:
+        return s
+    return "'" + s.replace("'", "''") + "'"
+
+
+def _yaml_emit(node, indent=0):
+    pad = "  " * indent
+    if isinstance(node, dict):
+        if not node:
+            return pad + "{}\n"
+        out = []
+        for k, v in node.items():
+            key = _yaml_scalar(k)
+            if isinstance(v, dict) and v:
+                out.append("%s%s:\n%s" % (pad, key, _yaml_emit(v, indent + 1)))
+            elif isinstance(v, list):
+                if not v:
+                    out.append("%s%s: []\n" % (pad, key))
+                    continue
+                out.append("%s%s:\n" % (pad, key))
+                for item in v:
+                    if isinstance(item, dict):
+                        sub = _yaml_emit(item, indent + 2).lstrip()
+                        first, _, rest = sub.partition("\n")
+                        out.append("%s  - %s\n%s" % (pad, first, rest))
+                    else:
+                        out.append("%s  - %s\n" % (pad, _yaml_scalar(item)))
+            elif isinstance(v, dict):
+                out.append("%s%s: {}\n" % (pad, key))
+            else:
+                out.append("%s%s: %s\n" % (pad, key, _yaml_scalar(v)))
+        return "".join(out)
+    if isinstance(node, list):
+        return "".join("%s- %s\n" % (pad, _yaml_scalar(v)) for v in node)
+    return pad + _yaml_scalar(node) + "\n"
+
+
+CONFIG_SPEC = FlagSpec().b("-q", "--quiet", "--services", "--images",
+                           "--volumes", "--profiles", "--hash").v("--format",
+                                                                  "--output", "-o")
+
+
+def cmd_config(opts, flags):
+    p = Project(opts)
+    if flags.get("services"):
+        for s in sorted(p.services):
+            print(s)
+        return 0
+    if flags.get("images"):
+        for s in sorted(p.services):
+            print(p.services[s].get("image", ""))
+        return 0
+    if flags.get("volumes"):
+        for v in (p.config.get("volumes") or {}):
+            print(v)
+        return 0
+    if flags.get("profiles"):
+        profs = set(opts.get("profiles") or [])
+        for cfg in p.services.values():
+            pr = cfg.get("profiles") or []
+            profs |= set(pr if isinstance(pr, list) else [pr])
+        for x in sorted(profs):
+            print(x)
+        return 0
+    if flags.get("hash"):
+        for s in sorted(p.services):
+            print("%s %s" % (s, config_hash(p.services[s])))
+        return 0
+    if flags.get("quiet"):
+        return 0
+    fmt = flags.get("format", "yaml")
+    model = {"name": p.name,
+             "services": {k: v for k, v in sorted(p.services.items())}}
+    text = json.dumps(model, indent=2, sort_keys=True, default=str) + "\n" \
+        if fmt == "json" else _yaml_emit(model)
+    if flags.get("output"):
+        with open(flags["output"], "w", encoding="utf-8") as fh:
+            fh.write(text)
+    else:
+        sys.stdout.write(text)
+    return 0
+
+
+VERSION_SPEC = FlagSpec().b("--short").v("-f", "--format")
+
+
+def cmd_version(opts, flags):
+    if flags.get("short"):
+        print(VERSION)
+        return 0
+    if flags.get("format") == "json":
+        print(json.dumps({"Version": VERSION, "Tool": "ucompose",
+                          "Backend": "udocker",
+                          "Os": sys.platform,
+                          "Arch": os.uname().machine}))
+    else:
+        print("ucompose version %s (docker-compose-compatible frontend for udocker)" % VERSION)
+    return 0
+
+
+def _split_ref(p, ref):
+    if ":" in ref[1:]:
+        svc, path = ref.split(":", 1)
+        if svc in p.services:
+            return svc, path
+    return None, ref
+
+
+def cmd_cp(opts, flags):
+    p = Project(opts)
+    lc = Lifecycle(p, opts)
+    pos = flags["_pos"]
+    if len(pos) != 2:
+        raise UserError("usage: ucompose cp SERVICE:SRC PATH | ucompose cp PATH SERVICE:DST")
+    sa, pa = _split_ref(p, pos[0])
+    sb, pb = _split_ref(p, pos[1])
+    if sa and not sb:
+        root = lc.ud.container_root(lc.p.container_name(sa))
+        if not root:
+            raise UserError('service "%s" has no container' % sa)
+        rel = pa.lstrip("/").rstrip("/")
+        base_name = os.path.basename(rel) or "root"
+        if pb == "-" or pb == "/dev/stdout":
+            return subprocess.call(["tar", "-C", root, "-cf", "-", "--", rel])
+        dest = os.path.join(pb, base_name) if os.path.isdir(pb) \
+            else os.path.abspath(pb)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        rd, wr = os.pipe()
+        src_parent = os.path.join(root, os.path.dirname(rel)) \
+            if os.path.dirname(rel) else root
+        t1 = subprocess.Popen(["tar", "-C", src_parent, "-cf", "-",
+                               "--", base_name], stdout=wr)
+        os.close(wr)
+        t2 = subprocess.Popen(["tar", "-xf", "-", "-C",
+                               os.path.dirname(dest)], stdin=rd)
+        os.close(rd)
+        rc1 = t1.wait()
+        rc2 = t2.wait()
+        extracted = os.path.join(os.path.dirname(dest), base_name)
+        if not rc1 and not rc2 and not os.path.isdir(pb) \
+                and extracted != dest:
+            os.replace(extracted, dest)
+        return rc2 or rc1
+    if sb and not sa:
+        root = lc.ud.container_root(lc.p.container_name(sb))
+        if not root:
+            raise UserError('service "%s" has no container' % sb)
+        src_abs = os.path.abspath(pa)
+        base = os.path.basename(src_abs.rstrip("/")) or "."
+        dest_rel = pb.lstrip("/").rstrip("/")
+        parent = os.path.dirname(dest_rel)
+        mk = os.path.join(root, parent) if parent else root
+        subprocess.check_call(["mkdir", "-p", mk])
+        rd, wr = os.pipe()
+        t1 = subprocess.Popen(["tar", "-C", os.path.dirname(src_abs),
+                               "-cf", "-", "--", base], stdout=wr)
+        os.close(wr)
+        t2 = subprocess.Popen(["tar", "-C", mk, "-xf", "-"], stdin=rd)
+        os.close(rd)
+        rc1 = t1.wait()
+        rc2 = t2.wait()
+        return rc2 or rc1
+    raise UserError("exactly one of SRC/DST must reference a service")
+
+
+EXPORT_SPEC = FlagSpec().v("-o", "--output", "--index")
+
+
+def cmd_export(opts, flags):
+    p = Project(opts)
+    lc = Lifecycle(p, opts)
+    pos = flags["_pos"]
+    if not pos:
+        raise UserError("usage: ucompose export [OPTIONS] SERVICE")
+    svc = pos[0]
+    key = lc.key_for(svc, int(flags.get("index") or 1))
+    entry = lc.state["services"].get(key)
+    if not entry:
+        raise UserError("no such service: %s" % svc)
+    root = lc.ud.container_root(entry["container"])
+    if not root:
+        raise UserError('container for "%s" not found' % svc)
+    out = flags.get("output")
+    argv = ["tar", "-C", root, "-cf", out or "-", "."]
+    return subprocess.call(argv)
+
+
+def cmd_doctor(opts, flags):
+    ok = True
+
+    def check(label, good, detail=""):
+        nonlocal ok
+        good = bool(good)
+        print("%-4s %-22s %s" % ("[ok]" if good else "[!!]", label, detail))
+        return good
+
+    import platform
+    print("ucompose %s — environment check" % VERSION)
+    uid = os.getuid() if hasattr(os, "getuid") else -1
+    euid = os.geteuid() if hasattr(os, "geteuid") else -1
+    ok &= check("user", True,
+                "uid=%d euid=%d%s" % (uid, euid,
+                                      "  (udocker needs non-root)" if euid == 0 else ""))
+    ok &= check("python", sys.executable or sys.version.split()[0],
+                "%s on %s/%s" % (platform.python_version(),
+                                 sys.platform, os.uname().machine))
+    ud_bin = os.environ.get("UCOMPOSE_UDOCKER") or shutil.which("udocker")
+    ok &= check("udocker binary", bool(ud_bin), ud_bin or "NOT FOUND in PATH")
+    ud_dir = os.environ.get("UDOCKER_DIR",
+                            os.path.join(os.path.expanduser("~"), ".udocker"))
+    ok &= check("UDOCKER_DIR", os.path.isdir(ud_dir), ud_dir)
+    proot_env = os.environ.get("UDOCKER_USE_PROOT_EXECUTABLE", "")
+    ok &= check("proot executable", bool(proot_env) and os.path.exists(proot_env),
+                proot_env or "not set (may still work)")
+    if ud_bin:
+        try:
+            u = Udocker(Project(opts))
+            out = u.call(["images"], capture=True, check=False).stdout
+            imgs = [ln.split()[0] for ln in out.splitlines()[1:] if ln.split()]
+            ok &= check("images", True, ", ".join(sorted(imgs)) or "none pulled")
+        except Exception as exc:
+            ok &= check("images", False, "error: %s" % exc)
+    print("\nresult: %s" % ("all checks passed" if ok
+                            else "problems detected (see [!!] above)"))
+    return 0 if ok else 1
+
+
+def _unsupported(name, why):
+    def fn(opts, flags):
+        raise UserError("%s is not possible with udocker: %s" % (name, why))
+    return fn
+
+COMMANDS = {
+    "up": (cmd_up, UP_SPEC, "Create and start containers"),
+    "down": (cmd_down, DOWN_SPEC, "Stop and remove containers, networks"),
+    "stop": (cmd_stop, STOP_SPEC, "Stop services"),
+    "kill": (cmd_kill, KILL_SPEC, "Force stop service containers by signal"),
+    "restart": (cmd_restart, RESTART_SPEC, "Restart service containers"),
+    "start": (cmd_start, FlagSpec(), "Start service containers"),
+    "create": (cmd_create, CREATE_SPEC, "Creates containers for a service"),
+    "rm": (cmd_rm_cmd, RM_SPEC, "Removes stopped service containers"),
+    "pull": (cmd_pull, PULL_SPEC, "Pull service images"),
+    "run": (cmd_run, RUN_SPEC, "Run a one-off command on a service"),
+    "exec": (cmd_exec, EXEC_SPEC, "Execute a command in a running container"),
+    "ps": (cmd_ps, PS_SPEC, "List containers"),
+    "logs": (cmd_logs, LOGS_SPEC, "View output from containers"),
+    "top": (cmd_top, TOP_SPEC, "Display the running processes"),
+    "images": (cmd_images, IMAGES_SPEC, "List images used by the created containers"),
+    "port": (cmd_port, PORT_SPEC, "Print the public port for a port binding"),
+    "wait": (cmd_wait, WAIT_SPEC, "Block until containers of all services stop"),
+    "ls": (cmd_ls, LS_SPEC, "List running compose projects"),
+    "events": (cmd_events, EVENTS_SPEC, "Receive real time events from containers"),
+    "pause": (cmd_pause, PAUSE_SPEC, "Pause services"),
+    "unpause": (cmd_unpause, PAUSE_SPEC, "Unpause services"),
+    "cp": (cmd_cp, CP_SPEC, "Copy files/folders between a service container "
+                            "and the local filesystem"),
+    "export": (cmd_export, EXPORT_SPEC, "Export a service container's filesystem "
+                                        "as a tar archive"),
+    "config": (cmd_config, CONFIG_SPEC, "Parse, resolve and render compose file"),
+    "version": (cmd_version, VERSION_SPEC, "Show version information"),
+    "doctor": (cmd_doctor, FlagSpec(), "Check environment: python, udocker, images"),
+    "build": (_unsupported("build", "udocker cannot build images; pull prebuilt ones"),
+              FlagSpec(), "(unsupported with udocker)"),
+    "push": (_unsupported("push", "udocker has no registry push support"),
+             FlagSpec(), "(unsupported with udocker)"),
+    "commit": (_unsupported("commit", "udocker cannot create images from containers"),
+               FlagSpec(), "(unsupported with udocker)"),
+    "stats": (_unsupported("stats", "no kernel cgroup accounting available under proot"),
+              FlagSpec(), "(unsupported with udocker)"),
+    "watch": (_unsupported("watch", "no image build pipeline exists"),
+              FlagSpec(), "(unsupported with udocker)"),
+}
+
+GLOBAL_OPTS = {
+    "-f": "file", "--file": "file",
+    "-p": "project_name", "--project-name": "project_name",
+    "--project-directory": "project_directory",
+    "--env-file": "env_file",
+    "--profile": "profiles",
+    "-n": "dry_run", "--dry-run": "dry_run",
+    "-v": "verbose", "--verbose": "verbose",
+}
+
+def parse_global(argv):
+    opts = {}
+    i = 0
+    while i < len(argv) and argv[i].startswith("-"):
+        arg = argv[i]
+        if arg == "--":
+            return opts, argv[i + 1:]
+        if arg in ("-h", "--help"):
+            print_usage()
+            sys.exit(0)
+        key = GLOBAL_OPTS.get(arg)
+        if key is None:
+            m = re.match(r"^(--[a-z-]+)=(.*)$", arg)
+            if m and GLOBAL_OPTS.get(m.group(1)):
+                key, val = GLOBAL_OPTS[m.group(1)], m.group(2)
+                i += 1
+            else:
+                raise UserError("unknown global option: %s" % arg)
+        else:
+            if key in ("dry_run", "verbose"):
+                val = True
+                i += 1
+            elif "=" in arg and arg.startswith("--"):
+                val = arg.split("=", 1)[1]
+                i += 1
+            else:
+                i += 1
+                try:
+                    val = argv[i]
+                except IndexError:
+                    raise UserError("option %s requires an argument" % arg)
+                i += 1
+        if key == "profiles":
+            opts.setdefault("profiles", []).append(val)
+        elif key == "file":
+            opts.setdefault("file", []).append(os.path.abspath(val))
+        else:
+            opts[key] = val
+    return opts, argv[i:]
+
+
+USAGE = """\
+Usage: ucompose [OPTIONS] COMMAND [ARGS...]
+
+Docker-compose-compatible frontend for udocker (rootless, no daemon).
+
+Options:
+  -f, --file FILE             Compose file (default: compose.yml|docker-compose.yml)
+  -p, --project-name NAME     Project name (default: directory name)
+      --project-directory DIR Working directory
+      --env-file FILE         Environment file for interpolation
+      --profile NAME          Enable a profile (repeatable)
+  -n, --dry-run               Print udocker commands instead of running them
+  -v, --verbose               Show udocker command lines as they run
+  -h, --help                  Show this help
+
+Commands:
+%s
+
+Run 'ucompose COMMAND --help' for command options.
+"""
+
+
+def print_usage():
+    width = max(len(c) for c in COMMANDS)
+    lines = "".join("  %-*s   %s\n" % (width, c, meta[2])
+                    for c, meta in sorted(COMMANDS.items()))
+    sys.stdout.write(USAGE % lines)
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv:
+        print_usage()
+        return 0
+    try:
+        opts, rest = parse_global(argv)
+        if not rest:
+            print_usage()
+            return 0
+        cmd_name = rest[0]
+        spec_entry = COMMANDS.get(cmd_name)
+        if spec_entry is None:
+            raise UserError("unknown command: %s" % cmd_name)
+        fn, spec, _ = spec_entry
+        args = rest[1:]
+        if "-h" in args or "--help" in args:
+            print("Usage: ucompose %s [OPTIONS]%s\n\n%s" %
+                  (cmd_name,
+                   " [SERVICE...]" if cmd_name not in ("version", "config", "ls",
+                                                       "run", "exec", "port", "cp")
+                   else "", spec.describe()))
+            return 0
+        flags = take_flags(args, spec)
+        rc = fn(opts, flags)
+        return int(rc or 0)
+    except UserError as e:
+        sys.stderr.write("ucompose: error: %s\n" % e)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
