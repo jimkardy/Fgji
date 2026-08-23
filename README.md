@@ -1,2 +1,2 @@
 One Liner
-'' curl -sSL -o ucompose https://github.com/jimkardy/Fgji/releases/download/V1/ucompose.txt && chmod +x ucompose && ./ucompose doctor''
+bash '' curl -sSL -o ucompose https://github.com/jimkardy/Fgji/releases/download/V1/ucompose.txt && chmod +x ucompose && ./ucompose doctor''
