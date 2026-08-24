@@ -5,7 +5,10 @@ pkg install udocker
 ```
  or via its one liner. 
 (it would not work as a standalone package) 
-One Liner
+
+How to install ucompose and use it steps:
+
+One Liner installation process. 
 ```bash 
 curl -sSL -o ucompose https://github.com/jimkardy/Fgji/releases/latest/download/ucompose.txt && chmod +x ucompose && ./ucompose --help
 ```
