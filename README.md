@@ -1,38 +1,52 @@
-Note!!!! 
-You need udocker installed, it's latest release via 
+# 🚀 ucompose-for-udocker
+
+A lightweight, rootless `docker-compose` CLI translation layer built specifically for **Termux** users and environments without a compiled/compatible kernel. 
+
+Write your configurations as a native `docker-compose.yml` file, and `ucompose` will automatically translate and execute them as user-space `udocker` commands.
+
+---
+
+## 🌟 Key Features
+* **Zero Root Required:** Runs completely in user-space using `PRoot` / `Fakechroot`.
+* **Standard Syntax:** No need to learn complex `udocker` CLI flags. Write standard compose files.
+* **Kernel Independent:** Perfect for Android power users and legacy Linux hardware.
+* **Zero Maintenance Friction:** Designed for upstream stability with `udocker`.
+
+---
+
+## 📥 Installation
+
+> ⚠️ **Prerequisite:** Ensure you have `udocker` installed natively in Termux via `pkg install udocker` or its official one-liner script before proceeding.
+
+Instantly install and view the help menu using our official one-liner:
+
 ```bash
-pkg install udocker
-```
- or via its one liner. 
-(it would not work as a standalone package) 
-
-How to install ucompose and use it steps:
-
-One Liner installation process. 
-```bash 
 curl -sSL -o ucompose https://github.com/jimkardy/Fgji/releases/latest/download/ucompose.txt && chmod +x ucompose && ./ucompose --help
 ```
-Udocker ucompose is a compose cli for udocker. 
 
-When creating a comprese.yml, do it like you would create a docker-compose.yml, it will be automatically translated into udocker commands. 
+---
 
-Take note that not all the commands that docker has will work here, this scrip is targeting termux users who want compose features root less without the need of a karnel. 
+## 🛠️ Usage Examples
 
-Exemples 
+Interact with your containers exactly like you would using standard docker-compose:
 
 ```bash
+# Spin up your environment in the background
 ./ucompose up -d
 
+# Start your containers
 ./ucompose start
 
+# Stop execution
 ./ucompose stop
 
+# Tear down the stack
 ./ucompose down
 ```
-And many more... 
 
-Also, advantages and disadvantages:
-Advantage, udocker is an abandoned project, meaning this scrip will not receive major updates in the long term.
-(i won't update it unless udocker release a new version, highly unlikely) 
+---
 
-Disadvantage: No more updates, if udocker stop working this ucompose script will stop working too. 
+## ⚖️ Advantages & System Limitations
+
+* **Advantage:** Because `udocker` is a mature, slow-moving project, this wrapper layout is highly stable and will not require constant breaking-change updates over the long term.
+* **Limitation:** Only core docker-compose commands translated by the script are supported. It is strictly optimized for user-space environment limitations.
