@@ -1,3 +1,6 @@
+Note!!!! 
+You need udocker installed, it's latest release via pkg install udocker or via its one liner. 
+(it would not work as a standalone package) 
 One Liner
 ```bash 
 curl -sSL -o ucompose https://github.com/jimkardy/Fgji/releases/latest/download/ucompose.txt && chmod +x ucompose && ./ucompose --help
