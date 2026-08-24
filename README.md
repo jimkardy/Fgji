@@ -1,5 +1,9 @@
 Note!!!! 
-You need udocker installed, it's latest release via pkg install udocker or via its one liner. 
+You need udocker installed, it's latest release via 
+```bash
+pkg install udocker
+```
+ or via its one liner. 
 (it would not work as a standalone package) 
 One Liner
 ```bash 
