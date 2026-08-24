@@ -20,3 +20,9 @@ Exemples
 ./ucompose down
 ```
 And many more... 
+
+Also, advantages and disadvantages:
+Advantage, udocker is an abandoned project, meaning this scrip will not receive major updates in the long term.
+(i won't update it unless udocker release a new version, highly unlikely) 
+
+Disadvantage: No more updates, if udocker stop working this ucompose script will stop working too. 
