@@ -16,9 +16,9 @@ Write your configurations as a native `docker-compose.yml` file, and `ucompose` 
 
 ## 📥 Installation
 
-> ⚠️ **Prerequisite:** Ensure you have `udocker` installed natively in Termux via `pkg install udocker` or its official one-liner script before proceeding.
+> ⚠️ **Prerequisite:** Ensure you have `udocker` installed natively in Termux via `pkg install udocker` or its official github https://github.com/indigo-dc/udocker before proceeding.
 
-Instantly install and view the help menu using our official one-liner:
+Instantly install ucompose and view the help menu using our official one-liner:
 
 ```bash
 curl -sSL -o ucompose https://github.com/jimkardy/Fgji/releases/latest/download/ucompose.txt && chmod +x ucompose && ./ucompose --help
