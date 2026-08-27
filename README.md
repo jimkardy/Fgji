@@ -11,6 +11,7 @@ Write your configurations as a native `docker-compose.yml` file, and `ucompose` 
 * **Standard Syntax:** No need to learn complex `udocker` CLI flags. Write standard compose files.
 * **Kernel Independent:** Perfect for Android power users and legacy Linux hardware.
 * **Zero Maintenance Friction:** Designed for upstream stability with `udocker`.
+* **First read our guidelines on our** [docs](https://reddit.com/r/ucompose/w/index/docs?utm_medium=android_app&utm_source=share)
 
 ---
 
